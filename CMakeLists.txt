@@ -7,7 +7,7 @@ set(CMAKE_C_STANDARD_REQUIRED true)
 
 
 
-add_library(rkcanfd SHARED rkcanfd.cpp)
+add_library(rkcanfd SHARED rkcanfd.c)
 
 
 set(THREADS_PREFER_PTHREAD_FLAG ON)

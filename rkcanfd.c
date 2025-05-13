@@ -15,6 +15,7 @@
 #include "rkcanfd.h"
 
 
+#define ISO_TP_MAX_PAYLOAD 4095
 
 
 int linkup(int phycan) {
@@ -66,7 +67,7 @@ int linkconnect(int phycan, int* link, int canfd) {
     addr.can_family = AF_CAN;
     addr.can_ifindex = ifr.ifr_ifindex;
 
-    if (bind(s, &addr, sizeof(addr)) < 0) {
+    if (bind(s, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         perror("bind");
         close(s);
         return -1;
@@ -76,16 +77,349 @@ int linkconnect(int phycan, int* link, int canfd) {
     return 0;
 }
 
+int recv_controlflow(int link, uint8_t* bs, uint8_t* stmin) {
+    fd_set readfds;
+    uint8_t pci;
+    for (int i = 0; i < 3; i++) {
+        FD_ZERO(&readfds);
+        FD_SET(link, &readfds);
+        struct timeval tv2 = {.tv_sec = 1};
+        if (select(link + 1, &readfds, NULL, NULL, &tv2) < 0) {
+            perror("control flow");
+            return -1;
+        } 
+        struct can_frame ccf;
+        if (read(link, &ccf, sizeof(ccf)) < 0) {
+            perror("recv control flow data");
+            return -1;
+        }
+        pci = ccf.data[0];
+        if (pci == 0x30) {
+            *bs = ccf.data[1];
+            *stmin = ccf.data[2];
+            return 0;
+        } else if (pci == 0x32) {
+            perror("overflow");
+            return -1;
+        } else if (pci == 0x31) {
+            continue;
+        } else {
+            perror("not control flow frame");
+            return -1;
+        }
+    }
+    perror("timeout");
+    return -1;
+}
+
+uint32_t stmin_to_us(uint8_t stmin) {
+    // prepare for usleep(stmin);
+    if (stmin > 0 && stmin <= 0x7F)  {
+        return stmin * 1000;   // to us
+    } else if (stmin >= 0xF1 && stmin <= 0xF9) {
+        return 100 * (stmin & 0xF); 
+    } else {    // ignore other case
+        return 0;
+    }
+}
 
 int linksend(int link, const link_frame* frame, int timeout) {
+    if (!frame) {return -1;}
+    fd_set writefds, readfds;
+    struct timeval tv;
+    const uint8_t* data = frame->data;
+    uint32_t can_id = frame->can_id;
+    uint32_t total_len = frame->len;
 
+    int mtu = frame->canfd ? CANFD_MAX_DLEN : CAN_MAX_DLEN;
+
+
+    // single frame
+    if ((frame->canfd && total_len <= 62) || (!frame->canfd && total_len <= 7)) {
+        FD_ZERO(&writefds);
+        FD_SET(link, &writefds);
+        tv.tv_sec = timeout / 1000;
+        tv.tv_usec = (timeout % 1000) * 1000;
+        if (select(link + 1, NULL, &writefds, NULL, NULL) <= 0) {
+            perror("select");
+            return -1;
+        }
+ 
+        if (frame->canfd) {
+            struct canfd_frame cf = {.can_id = can_id};
+            if (total_len < 8) {
+                cf.data[0] = total_len & 0xF;
+                memcpy(cf.data + 1, data, total_len);
+                cf.len = total_len + 1;
+            } else {
+                cf.data[0] = 0;
+                cf.data[1] = frame->len;
+                memcpy(cf.data + 2, data, total_len);
+                cf.len = total_len + 2;
+            }
+            return write(link, &cf, sizeof(cf));
+        } else {
+            struct can_frame cf = {.can_id = can_id, .len = total_len + 1};
+            cf.data[0] = total_len & 0xF;
+            memcpy(cf.data + 1, data, total_len);
+            return write(link, &cf, sizeof(cf));
+        }      
+    }   
+
+
+    // multiframe
+    uint8_t firstlen = mtu - 2;   // 2 bytes used for FF header
+    uint16_t len = total_len;
+
+    // prepare first frame
+    FD_ZERO(&writefds);
+    FD_SET(link, &writefds);
+    tv.tv_sec = timeout / 1000;
+    tv.tv_usec = (timeout % 1000) * 1000;
+    if (select(link + 1, NULL, &writefds, NULL, NULL) <= 0) {
+        perror("select");
+        return -1;
+    }
+    // send first frame
+    if (frame->canfd) {
+        struct canfd_frame cf = {.can_id = can_id, .len = mtu};
+        cf.data[0] = 0x10 | ((len >> 8)& 0xF);
+        cf.data[1] = len & 0xFF;
+        memcpy(cf.data + 2, data, firstlen);
+        if (write(link, &cf, sizeof(cf)) < 0) return -1;
+    } else {
+        struct can_frame cf = {.can_id = can_id, .len = mtu};
+        cf.data[0] = 0x10 | ((len >> 8)& 0xF);
+        cf.data[1] = len & 0xFF;
+        memcpy(cf.data + 2, data, firstlen);
+        if (write(link, &cf, sizeof(cf)) < 0) return -1;
+    }     
+
+    // recv control flow
+    uint8_t bs, stmin;
+    if (recv_controlflow(link, &bs, &stmin) < 0) {
+        return -1;
+    }
+
+    // compute how many us need to wait.
+    uint32_t us = stmin_to_us(stmin);
+
+    // send consecutive frame
+    int offset = firstlen;
+    uint8_t seq = 1;
+    uint8_t c = 0;     // for count bs;
+    while (offset < total_len) {
+        // the data carry by this cf. either mtu - 1 (normal) or total_len - offset (last one) 
+        uint8_t cf_len = ((total_len - offset) > (mtu - 1))?  (mtu - 1) : (total_len - offset);
+
+        FD_ZERO(&writefds);
+        FD_SET(link, &writefds);
+        tv.tv_sec = timeout / 1000;
+        tv.tv_usec = (timeout % 1000) * 1000;
+        if (select(link + 1, NULL, &writefds, NULL, &tv) <= 0)  return -1;
+        
+        if (frame->canfd) {
+            struct canfd_frame cf = {.can_id = can_id, .len = cf_len + 1};
+            cf.data[0] = 0x20 | (seq & 0xF);
+            memcpy(cf.data + 1, data + offset, cf_len);
+            if (write(link, &cf, sizeof(cf)) < 0) return -1;
+        } else {
+            struct can_frame cf = {.can_id = can_id, .len = cf_len + 1};
+            cf.data[0] = 0x20 | (seq & 0xF);
+            memcpy(cf.data + 1, data + offset, cf_len);
+            if (write(link, &cf, sizeof(cf)) < 0) return -1;
+        }
+
+        seq = (seq + 1) & 0xF;
+        offset += cf_len;
+        c++;
+        usleep(us);
+        // bs = 0 means we can send all the frame without waiting another cf
+        // bs > 0 means we must wait for another cf when we have send bs frames
+        if (bs > 0 && c == bs) {
+            if (recv_controlflow(link, &bs, &stmin) < 0) return -1;
+            us = stmin_to_us(stmin);
+            c = 0;
+        }
+    }
+
+    return 0;
 }
+
 int linkrecv(int link, link_frame* frame, int timeout) {
+    fd_set readfds, writefds;
+    int ret = 0;
+    int canfd = frame->canfd;
+    struct canfd_frame canfd_frame; 
+    struct can_frame can_frame;
+    uint8_t pci;  
 
+    struct timeval tv;
+    tv.tv_sec = timeout / 1000;
+    tv.tv_usec = (timeout % 1000) * 1000;
+
+    while (1) {
+        FD_ZERO(&readfds);
+        FD_SET(link, &readfds);
+
+        ret = select(link + 1, &readfds, NULL, NULL, &timeout);
+        if (ret <= 0) {
+            perror("Timeout or select error");
+            return -1;
+        }
+
+        if (canfd) {
+            ret = read(link, &canfd_frame, sizeof(canfd_frame));
+            pci = canfd_frame.data[0];       
+        } else {
+            ret = read(link, &can_frame, sizeof(can_frame));
+            pci = can_frame.data[0];       
+        }
+
+        if (ret < 0) {
+            perror("read");
+            return -1;
+        }
+
+        // single frame
+        if ((pci & 0xF0) == 0x00) {
+            uint8_t len = pci & 0xF;
+            if (canfd) {
+                if (len <= 7) {
+                    memcpy(frame->data, canfd_frame.data[1], len);
+                } else {
+                    len = canfd_frame.data[1];
+                    memcpy(frame->data, canfd_frame.data[2], len);
+                }
+                frame->can_id = canfd_frame.can_id;
+                frame->len = len;
+            } else {
+                memcpy(frame->data, can_frame.data[1], len);
+                frame->can_id = can_frame.can_id;
+                frame->len = len;
+            }
+            return len;
+        }
+        // first frame (cf will be process in this block)
+        else if ((pci & 0xF0) == 0x10) {
+            size_t offset, total_len;
+            uint8_t mtu;
+
+            // process first frame
+            if (canfd) {
+                memcpy(frame->data, canfd_frame.data[2], CANFD_MAX_DLEN - 2);
+                frame->can_id = canfd_frame.can_id;
+                offset = CANFD_MAX_DLEN - 2;
+                mtu = CANFD_MAX_DLEN;
+                total_len = ((pci & 0x0F) << 8) | canfd_frame.data[1];
+            } else {
+                memcpy(frame->data, can_frame.data[2], CAN_MAX_DLEN - 2);
+                frame->can_id = can_frame.can_id;
+                offset = CAN_MAX_DLEN - 2;
+                mtu = CAN_MAX_DLEN;
+                total_len = ((pci & 0x0F) << 8) | can_frame.data[1];
+            }
+
+            // send the control flow frame. note that both bs and stmin set to 0.
+            FD_ZERO(&writefds);
+            FD_SET(link, &writefds);
+            if (canfd) {
+                memset(&canfd_frame, 0, sizeof(canfd_frame));
+                canfd_frame.can_id = frame->can_id;
+                canfd_frame.len = 8;
+                canfd_frame.data[0] = 0x30;
+            } else {
+                memset(&can_frame, 0, sizeof(can_frame));
+                can_frame.can_id = frame->can_id;
+                can_frame.len = 8;
+                can_frame.data[0] = 0x30; 
+            }
+
+            struct timeval tv2 = {.tv_sec = 1};
+            if (select(link + 1, NULL, &writefds, NULL, &tv2) <= 0) {
+                perror("select error when send control flow frame");
+                return -1;
+            }
+            if (canfd) {
+                if (write(link, &canfd_frame, sizeof(canfd_frame)) < 0) {
+                    perror("send FC");
+                    return -1;
+                } 
+            } else {
+                if (write(link, &can_frame, sizeof(can_frame)) < 0) {
+                    perror("send FC");
+                    return -1;
+                } 
+            }
+
+            // TODO: move this block to outer while loop to reduce repeated code.
+            // after that, we should receive consecutive frame
+            uint8_t expected_sn = 1;
+            uint8_t sn = 0;
+            while (offset < total_len) {
+                FD_ZERO(&readfds);
+                FD_SET(link, &readfds);
+
+                if (select(link + 1, &readfds, NULL, NULL, &tv) <= 0) {
+                    perror("select error when receive consecutive frame");
+                    return -1;
+                }
+                if (canfd) {
+                    ret = read(link, &canfd_frame, sizeof(canfd_frame));
+                    sn = canfd_frame.data[0] & 0xF;
+                } else {
+                    ret = read(link, &can_frame, sizeof(can_frame));
+                    sn = can_frame.data[0] & 0xF;
+                }
+                if (ret < 0) {
+                    perror("read consecutive frame error");
+                    return -1;
+                }
+
+                if (sn != expected_sn) {
+                    fprintf(stderr, "SN mismatch: got %d, expected %d\n", sn, expected_sn);
+                    return -1;
+                }
+                expected_sn = (expected_sn + 1) % 0x10;
+
+                size_t remaining = total_len - offset;
+                size_t copy_len = (remaining > (mtu -1))? (mtu - 1) : remaining;
+                if (canfd) {
+                    memcpy(frame->data + offset, &canfd_frame.data[1], copy_len);
+                } else {
+                    memcpy(frame->data + offset, &can_frame.data[1], copy_len);
+                }
+
+                offset += copy_len;
+
+
+
+            }
+
+            
+        } else {
+            perror("PCI unhandle");
+            return -1;
+        }
+    }
 }
 
-int linkfilter(int link, uint32_t* filters, int size) {
+int linkfilter_canid(int link, uint32_t* canids, int size) {
+    struct can_filter filters[size + 1];
+    // default accept all data in range 0x700 ~ 0x7FF;
+    filters[0].can_id = 0x700;
+    filters[0].can_mask = 0x700;
 
+    for (int i = 0; i < size; i++) {
+        filters[i+1].can_id = canids[i];
+        filters[i+1].can_mask = CAN_SFF_MASK;
+    }
+
+    if (setsockopt(link, SOL_CAN_RAW, CAN_RAW_FILTER, &filters, sizeof(filters)) < 0) {
+        perror("setsockopt");
+        return -1;
+    }
+    return 0;
 }
 
 int linkdisconnect(int link) {
