@@ -150,16 +150,16 @@ int linksend(int link, const link_frame* frame, int timeout) {
             if (total_len < 8) {
                 cf.data[0] = total_len & 0xF;
                 memcpy(cf.data + 1, data, total_len);
-                cf.len = total_len + 1;
+                cf.len = 8;
             } else {
                 cf.data[0] = 0;
                 cf.data[1] = frame->len;
                 memcpy(cf.data + 2, data, total_len);
-                cf.len = total_len + 2;
+                cf.len = 64;
             }
             return write(link, &cf, sizeof(cf));
         } else {
-            struct can_frame cf = {.can_id = can_id, .len = total_len + 1};
+            struct can_frame cf = {.can_id = can_id, .can_dlc = 8};
             cf.data[0] = total_len & 0xF;
             memcpy(cf.data + 1, data, total_len);
             return write(link, &cf, sizeof(cf));
@@ -188,7 +188,7 @@ int linksend(int link, const link_frame* frame, int timeout) {
         memcpy(cf.data + 2, data, firstlen);
         if (write(link, &cf, sizeof(cf)) < 0) return -1;
     } else {
-        struct can_frame cf = {.can_id = can_id, .len = mtu};
+        struct can_frame cf = {.can_id = can_id, .can_dlc = mtu};
         cf.data[0] = 0x10 | ((len >> 8)& 0xF);
         cf.data[1] = len & 0xFF;
         memcpy(cf.data + 2, data, firstlen);
@@ -219,12 +219,12 @@ int linksend(int link, const link_frame* frame, int timeout) {
         if (select(link + 1, NULL, &writefds, NULL, &tv) <= 0)  return -1;
         
         if (frame->canfd) {
-            struct canfd_frame cf = {.can_id = can_id, .len = cf_len + 1};
+            struct canfd_frame cf = {.can_id = can_id, .len = 64};
             cf.data[0] = 0x20 | (seq & 0xF);
             memcpy(cf.data + 1, data + offset, cf_len);
             if (write(link, &cf, sizeof(cf)) < 0) return -1;
         } else {
-            struct can_frame cf = {.can_id = can_id, .len = cf_len + 1};
+            struct can_frame cf = {.can_id = can_id, .can_dlc = 8};
             cf.data[0] = 0x20 | (seq & 0xF);
             memcpy(cf.data + 1, data + offset, cf_len);
             if (write(link, &cf, sizeof(cf)) < 0) return -1;
@@ -255,18 +255,27 @@ int linkrecv(int link, link_frame* frame, int timeout) {
     uint8_t pci;  
 
     struct timeval tv;
-    tv.tv_sec = timeout / 1000;
-    tv.tv_usec = (timeout % 1000) * 1000;
+
+    // for receiving consecutive frame
+    size_t offset, total_len;
+    uint8_t mtu = canfd? CANFD_MAX_DLEN : CAN_MAX_DLEN;
+    uint8_t expected_sn = 1;
+    uint8_t sn = 0;
 
     while (1) {
         FD_ZERO(&readfds);
         FD_SET(link, &readfds);
 
-        ret = select(link + 1, &readfds, NULL, NULL, &timeout);
-        if (ret <= 0) {
-            perror("Timeout or select error");
+        tv.tv_sec = timeout / 1000;
+        tv.tv_usec = (timeout % 1000) * 1000;
+
+        ret = select(link + 1, &readfds, NULL, NULL, &tv);
+        if (ret < 0) {
+            perror("select");
             return -1;
         }
+
+        if (ret == 0) return 0; // nothing recv
 
         if (canfd) {
             ret = read(link, &canfd_frame, sizeof(canfd_frame));
@@ -281,42 +290,39 @@ int linkrecv(int link, link_frame* frame, int timeout) {
             return -1;
         }
 
+
         // single frame
         if ((pci & 0xF0) == 0x00) {
             uint8_t len = pci & 0xF;
             if (canfd) {
-                if (len <= 7) {
-                    memcpy(frame->data, canfd_frame.data[1], len);
+                if (len <= 7 && len > 0) {
+                    memcpy(frame->data, &canfd_frame.data[1], len);
                 } else {
                     len = canfd_frame.data[1];
-                    memcpy(frame->data, canfd_frame.data[2], len);
+                    memcpy(frame->data, &canfd_frame.data[2], len);
                 }
                 frame->can_id = canfd_frame.can_id;
                 frame->len = len;
             } else {
-                memcpy(frame->data, can_frame.data[1], len);
+                memcpy(frame->data, &can_frame.data[1], len);
                 frame->can_id = can_frame.can_id;
                 frame->len = len;
             }
             return len;
         }
-        // first frame (cf will be process in this block)
+        // first frame 
         else if ((pci & 0xF0) == 0x10) {
-            size_t offset, total_len;
-            uint8_t mtu;
+            // the first frame contains (mtu - 2) bytes data
+            offset = mtu - 2;
 
-            // process first frame
+            // compute the total len
             if (canfd) {
-                memcpy(frame->data, canfd_frame.data[2], CANFD_MAX_DLEN - 2);
+                memcpy(frame->data, &canfd_frame.data[2], mtu - 2);
                 frame->can_id = canfd_frame.can_id;
-                offset = CANFD_MAX_DLEN - 2;
-                mtu = CANFD_MAX_DLEN;
                 total_len = ((pci & 0x0F) << 8) | canfd_frame.data[1];
             } else {
-                memcpy(frame->data, can_frame.data[2], CAN_MAX_DLEN - 2);
+                memcpy(frame->data, &can_frame.data[2], CAN_MAX_DLEN - 2);
                 frame->can_id = can_frame.can_id;
-                offset = CAN_MAX_DLEN - 2;
-                mtu = CAN_MAX_DLEN;
                 total_len = ((pci & 0x0F) << 8) | can_frame.data[1];
             }
 
@@ -331,7 +337,7 @@ int linkrecv(int link, link_frame* frame, int timeout) {
             } else {
                 memset(&can_frame, 0, sizeof(can_frame));
                 can_frame.can_id = frame->can_id;
-                can_frame.len = 8;
+                can_frame.can_dlc = 8;
                 can_frame.data[0] = 0x30; 
             }
 
@@ -341,62 +347,39 @@ int linkrecv(int link, link_frame* frame, int timeout) {
                 return -1;
             }
             if (canfd) {
-                if (write(link, &canfd_frame, sizeof(canfd_frame)) < 0) {
-                    perror("send FC");
-                    return -1;
-                } 
+                ret = write(link, &canfd_frame, sizeof(canfd_frame));
             } else {
-                if (write(link, &can_frame, sizeof(can_frame)) < 0) {
-                    perror("send FC");
-                    return -1;
-                } 
+                ret = write(link, &can_frame, sizeof(can_frame));
             }
 
-            // TODO: move this block to outer while loop to reduce repeated code.
-            // after that, we should receive consecutive frame
-            uint8_t expected_sn = 1;
-            uint8_t sn = 0;
-            while (offset < total_len) {
-                FD_ZERO(&readfds);
-                FD_SET(link, &readfds);
+            if (ret < 0) {
+                perror("send FC");
+                return -1;
+            } 
+        } 
 
-                if (select(link + 1, &readfds, NULL, NULL, &tv) <= 0) {
-                    perror("select error when receive consecutive frame");
-                    return -1;
-                }
-                if (canfd) {
-                    ret = read(link, &canfd_frame, sizeof(canfd_frame));
-                    sn = canfd_frame.data[0] & 0xF;
-                } else {
-                    ret = read(link, &can_frame, sizeof(can_frame));
-                    sn = can_frame.data[0] & 0xF;
-                }
-                if (ret < 0) {
-                    perror("read consecutive frame error");
-                    return -1;
-                }
+        // receive consecutive frame
+        else if ((pci & 0xF0) == 0x20) {
+            sn = pci & 0x0F;
+            if (sn != expected_sn) {
+                fprintf(stderr, "SN mismatch: got %d, expected %d\n", sn, expected_sn);
+                return -1;
+            }
+            expected_sn = (expected_sn + 1) % 0x10;
 
-                if (sn != expected_sn) {
-                    fprintf(stderr, "SN mismatch: got %d, expected %d\n", sn, expected_sn);
-                    return -1;
-                }
-                expected_sn = (expected_sn + 1) % 0x10;
+            size_t remaining = total_len - offset;
+            size_t copy_len = (remaining > (mtu -1))? (mtu - 1) : remaining;
+            if (canfd) {
+                memcpy(frame->data + offset, &canfd_frame.data[1], copy_len);
+            } else {
+                memcpy(frame->data + offset, &can_frame.data[1], copy_len);
+            }
+            offset += copy_len;
 
-                size_t remaining = total_len - offset;
-                size_t copy_len = (remaining > (mtu -1))? (mtu - 1) : remaining;
-                if (canfd) {
-                    memcpy(frame->data + offset, &canfd_frame.data[1], copy_len);
-                } else {
-                    memcpy(frame->data + offset, &can_frame.data[1], copy_len);
-                }
-
-                offset += copy_len;
-
-
-
+            if (offset >= total_len) {
+                return total_len;
             }
 
-            
         } else {
             perror("PCI unhandle");
             return -1;

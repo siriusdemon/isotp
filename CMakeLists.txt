@@ -14,3 +14,10 @@ set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
 target_link_libraries(rkcanfd PUBLIC Threads::Threads)
 
+add_executable(testiostp main.c)
+target_link_libraries(testiostp rkcanfd)
+set_target_properties(testiostp PROPERTIES
+    INSTALL_RPATH "$ORIGIN"
+    BUILD_WITH_INSTALL_RPATH TRUE
+)
+
