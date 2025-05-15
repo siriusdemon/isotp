@@ -21,3 +21,10 @@ set_target_properties(testiostp PROPERTIES
     BUILD_WITH_INSTALL_RPATH TRUE
 )
 
+
+add_executable(rktest rktest.c)
+target_link_libraries(rktest rkcanfd)
+set_target_properties(rktest PROPERTIES
+    INSTALL_RPATH "$ORIGIN"
+    BUILD_WITH_INSTALL_RPATH TRUE
+)

@@ -4,7 +4,7 @@
 typedef struct link_frame {
     uint32_t can_id;
     uint32_t len;
-    uint8_t data[4096];
+    uint8_t* data;
     int canfd;
 }link_frame;
 
