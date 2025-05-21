@@ -18,20 +18,31 @@
 #define ISO_TP_MAX_PAYLOAD 4095
 
 
-void printCanFrame(struct can_frame* frame) {
+static void printCanFrame(struct can_frame* frame) {
     printf("%02X %2d ", frame->can_id, frame->can_dlc);
     for (int i = 0; i < frame->can_dlc; i++) {
         printf("%02X ", frame->data[i]);
     }
     printf("\n");
+    fflush(stdout);
 }
 
-void printCanFdFrame(struct canfd_frame* frame) {
+static void printCanFdFrame(struct canfd_frame* frame) {
     printf("%02X %2d ", frame->can_id, frame->len);
     for (int i = 0; i < frame->len; i++) {
         printf("%02X ", frame->data[i]);
     }
     printf("\n");
+    fflush(stdout);
+}
+
+static void printframe(const link_frame* frame) {
+    printf("%02X %2d ", frame->can_id, frame->len);
+    for (int i = 0; i < frame->len; i++) {
+        printf("%02X ", frame->data[i]);
+    }
+    printf("\n");
+    fflush(stdout);
 }
 
 
@@ -70,6 +81,9 @@ int linkconnect(int phycan, int* link, int canfd) {
             return -1;
         }
     }
+
+    int sndbuf = 1048576; // 1MB
+    setsockopt(s, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
 
     // bind the socket
     struct ifreq ifr;
@@ -153,6 +167,7 @@ int linksend(int link, const link_frame* frame, int timeout) {
 
     // single frame
     if ((frame->canfd && total_len <= 62) || (!frame->canfd && total_len <= 7)) {
+        // printf("Single frame\n");
         FD_ZERO(&writefds);
         FD_SET(link, &writefds);
         tv.tv_sec = timeout / 1000;
@@ -163,6 +178,7 @@ int linksend(int link, const link_frame* frame, int timeout) {
         }
  
         if (frame->canfd) {
+            // printf("canfd frame\n");
             struct canfd_frame cf = {.can_id = can_id, .flags = CANFD_BRS};
             if (total_len < 8) {
                 cf.data[0] = total_len & 0xF;
@@ -177,16 +193,18 @@ int linksend(int link, const link_frame* frame, int timeout) {
             //printCanFdFrame(&cf);
             return write(link, &cf, sizeof(cf));
         } else {
+            // printf("can frame\n");
             struct can_frame cf = {.can_id = can_id, .can_dlc = 8};
             
             cf.data[0] = total_len & 0xF;
             memcpy(cf.data + 1, data, total_len);
-            //printCanFrame(&cf);
+            printCanFrame(&cf);
             return write(link, &cf, sizeof(cf));
         }      
     }   
 
 
+    // printf("multiframe\n");
     // multiframe
     uint8_t firstlen = mtu - 2;   // 2 bytes used for FF header
     uint16_t len = total_len;
@@ -223,11 +241,13 @@ int linksend(int link, const link_frame* frame, int timeout) {
 
     // compute how many us need to wait.
     uint32_t us = stmin_to_us(stmin);
+    us = us == 0? 200: us;
 
     // send consecutive frame
     int offset = firstlen;
     uint8_t seq = 1;
     uint8_t c = 0;     // for count bs;
+    //printf("us = %d\n", us);
     while (offset < total_len) {
         // the data carry by this cf. either mtu - 1 (normal) or total_len - offset (last one) 
         uint8_t cf_len = ((total_len - offset) > (mtu - 1))?  (mtu - 1) : (total_len - offset);
@@ -236,18 +256,27 @@ int linksend(int link, const link_frame* frame, int timeout) {
         FD_SET(link, &writefds);
         tv.tv_sec = timeout / 1000;
         tv.tv_usec = (timeout % 1000) * 1000;
-        if (select(link + 1, NULL, &writefds, NULL, &tv) <= 0)  return -1;
+        if (select(link + 1, NULL, &writefds, NULL, &tv) <= 0)  {
+            perror("select");
+            return -1;
+        }
         
         if (frame->canfd) {
             struct canfd_frame cf = {.can_id = can_id, .len = 64, .flags = CANFD_BRS};
             cf.data[0] = 0x20 | (seq & 0xF);
             memcpy(cf.data + 1, data + offset, cf_len);
-            if (write(link, &cf, sizeof(cf)) < 0) return -1;
+            if (write(link, &cf, sizeof(cf)) < 0) {
+                perror("write canfd");
+                return -1;
+            }
         } else {
             struct can_frame cf = {.can_id = can_id, .can_dlc = 8};
             cf.data[0] = 0x20 | (seq & 0xF);
             memcpy(cf.data + 1, data + offset, cf_len);
-            if (write(link, &cf, sizeof(cf)) < 0) return -1;
+            if (write(link, &cf, sizeof(cf)) < 0) {
+                perror("write can");
+                return -1;
+            }
         }
 
         seq = (seq + 1) & 0xF;
@@ -351,12 +380,12 @@ int linkrecv(int link, link_frame* frame, int timeout) {
             FD_SET(link, &writefds);
             if (canfd) {
                 memset(&canfd_frame, 0, sizeof(canfd_frame));
-                canfd_frame.can_id = frame->can_id;
+                canfd_frame.can_id = frame->can_id - 8;
                 canfd_frame.len = 8;
                 canfd_frame.data[0] = 0x30;
             } else {
                 memset(&can_frame, 0, sizeof(can_frame));
-                can_frame.can_id = frame->can_id;
+                can_frame.can_id = frame->can_id - 8;
                 can_frame.can_dlc = 8;
                 can_frame.data[0] = 0x30; 
             }
@@ -397,6 +426,7 @@ int linkrecv(int link, link_frame* frame, int timeout) {
             offset += copy_len;
 
             if (offset >= total_len) {
+                frame->len = total_len;
                 return total_len;
             }
 
