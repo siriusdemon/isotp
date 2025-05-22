@@ -85,6 +85,9 @@ int linkconnect(int phycan, int* link, int canfd) {
     int sndbuf = 1048576; // 1MB
     setsockopt(s, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
 
+    int loopback = 0;
+    setsockopt(s, SOL_CAN_RAW, CAN_RAW_LOOPBACK, &loopback, sizeof(loopback));
+
     // bind the socket
     struct ifreq ifr;
     struct sockaddr_can addr;
@@ -241,7 +244,7 @@ int linksend(int link, const link_frame* frame, int timeout) {
 
     // compute how many us need to wait.
     uint32_t us = stmin_to_us(stmin);
-    us = us == 0? 200: us;
+    us = us == 0? 100: us;
 
     // send consecutive frame
     int offset = firstlen;
